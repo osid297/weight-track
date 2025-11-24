@@ -2,71 +2,59 @@ import React from 'react';
 
 interface TableProps {
   children: React.ReactNode;
+  className?: string;
+  [key: string]: any;
 }
 
-interface TableHeaderProps {
-  children: React.ReactNode;
-}
+interface TableHeaderProps { children: React.ReactNode; className?: string; [key: string]: any; }
+interface TableBodyProps { children: React.ReactNode; className?: string; [key: string]: any; }
+interface TableRowProps { children: React.ReactNode; className?: string; [key: string]: any; }
+interface TableCellProps { children: React.ReactNode; className?: string; [key: string]: any; }
+interface TableHeadProps { children: React.ReactNode; className?: string; [key: string]: any; }
 
-interface TableBodyProps {
-  children: React.ReactNode;
-}
-
-interface TableRowProps {
-  children: React.ReactNode;
-}
-
-interface TableCellProps {
-  children: React.ReactNode;
-}
-
-interface TableHeadProps {
-  children: React.ReactNode;
-}
-
-export function Table({ children }: TableProps) {
+export function Table({ children, className = '', ...rest }: TableProps) {
   return (
-    <table className="min-w-full divide-y divide-gray-200">
+    <table className={`min-w-full divide-y divide-gray-200 ${className}`} {...rest}>
       {children}
     </table>
   );
 }
 
-export function TableHeader({ children }: TableHeaderProps) {
+export function TableHeader({ children, className = '', ...rest }: TableHeaderProps) {
   return (
-    <thead className="bg-gray-50">
+    <thead className={`bg-gray-50 ${className}`} {...rest}>
       {children}
     </thead>
   );
 }
 
-export function TableBody({ children }: TableBodyProps) {
+export function TableBody({ children, className = '', ...rest }: TableBodyProps) {
   return (
-    <tbody className="bg-white divide-y divide-gray-200">
+    <tbody className={`bg-white divide-y divide-gray-200 ${className}`} {...rest}>
       {children}
     </tbody>
   );
 }
 
-export function TableRow({ children }: TableRowProps) {
+export function TableRow({ children, className = '', ...rest }: TableRowProps) {
   return (
-    <tr>
+    <tr className={className} {...rest}>
       {children}
     </tr>
   );
 }
 
-export function TableCell({ children }: TableCellProps) {
+export function TableCell({ children, className = '', ...rest }: TableCellProps) {
   return (
-    <td className="px-6 py-4 whitespace-nowrap">
+    <td className={`px-6 py-4 whitespace-nowrap ${className}`} {...rest}>
       {children}
     </td>
   );
 }
 
-export function TableHead({ children }: TableHeadProps) {
+export function TableHead({ children, className = '', ...rest }: TableHeadProps) {
   return (
-    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+    <th className={`px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider ${className}`} {...rest}>
       {children}
     </th>
   );

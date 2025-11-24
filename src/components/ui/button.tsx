@@ -6,6 +6,8 @@ interface ButtonProps {
   className?: string;
   size?: 'sm' | 'md' | 'lg';
   variant?: 'default' | 'outline';
+  type?: 'button' | 'submit' | 'reset';
+  [key: string]: any;
 }
 
 export function Button({ 
@@ -13,7 +15,9 @@ export function Button({
   onClick, 
   className = '', 
   size = 'md',
-  variant = 'default'
+  variant = 'default',
+  type = 'button',
+  ...rest
 }: ButtonProps) {
   const sizeClasses = {
     sm: 'px-2 py-1 text-sm',
@@ -29,7 +33,9 @@ export function Button({
   return (
     <button
       onClick={onClick}
+      type={type}
       className={`rounded ${sizeClasses[size]} ${variantClasses[variant]} ${className}`}
+      {...rest}
     >
       {children}
     </button>
