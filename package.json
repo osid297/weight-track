@@ -1,5 +1,6 @@
 {
   "name": "weight-tracker",
+  "homepage": "https://osid297.github.io/weight-track",
   "version": "0.1.0",
   "private": true,
   "dependencies": {

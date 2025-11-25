@@ -1,7 +1,9 @@
 import React from 'react';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import WeightTrackerApp from './WeightTrackerApp';
+import WeightTrackerApp, { computeIntakeNotice, calculateEmpiricalKcalPerKgHelper } from './WeightTrackerApp';
+
+type TestEntry = { date: string; weight: number; calories?: number };
 
 // Recharts depends on browser APIs (ResizeObserver, SVG sizing). Mock it to keep tests lean.
 jest.mock('recharts', () => {
@@ -38,6 +40,33 @@ function getEntriesTable() {
 function getMeasurementTable() {
   const header = screen.getAllByText('Body Fat (%)').find(el => el.tagName === 'TH') as HTMLElement;
   return header.closest('table') as HTMLTableElement;
+}
+
+function buildEntries({
+  startDate = '2024-01-01',
+  days = 31,
+  startWeight = 70,
+  weightStep = 0.05,
+  calories = 2500
+}: {
+  startDate?: string;
+  days?: number;
+  startWeight?: number;
+  weightStep?: number;
+  calories?: number;
+}): TestEntry[] {
+  const start = new Date(startDate);
+  const entries: TestEntry[] = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start);
+    d.setDate(d.getDate() + i);
+    entries.push({
+      date: d.toISOString().split('T')[0],
+      weight: parseFloat((startWeight + weightStep * i).toFixed(2)),
+      calories
+    });
+  }
+  return entries;
 }
 
 describe('WeightTrackerApp', () => {
@@ -147,5 +176,123 @@ describe('WeightTrackerApp', () => {
 
     render(<WeightTrackerApp />);
     expect(screen.getByText('2024-01-05')).toBeInTheDocument();
+  });
+
+});
+
+describe('computeIntakeNotice', () => {
+  const baseInference = {
+    maintenanceCalories: 2500,
+    confidenceInterval: [2400, 2600] as [number, number],
+    weightChangeRate: 0,
+    weightChangeRateCI: [0, 0] as [number, number],
+    slopeCI: [0, 0] as [number, number],
+    intercept: 0,
+    daysOfData: 30,
+    r2: 0.5,
+    trendData: []
+  };
+  const baseEmp = { empirical: 7700, maintenance: 2500, r2: 0.5, intervals: 10 };
+
+  const inferenceFn = (override?: Partial<typeof baseInference>) => (_entries?: any, _conf?: any) => ({ ...baseInference, ...override });
+  const empFn = (override?: Partial<typeof baseEmp>) => (_entries?: any) => ({ ...baseEmp, ...override });
+
+  it('returns null when not enough data', () => {
+    const entries = buildEntries({ days: 5 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn(), empFn());
+    expect(res).toBeNull();
+  });
+
+  it('returns null when within CI/noise', () => {
+    const entries = buildEntries({ weightStep: 0.01 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn(), empFn());
+    expect(res).toBeNull();
+  });
+
+  it('flags gain larger than expected', () => {
+    const entries = buildEntries({ calories: 2600, weightStep: 0.05 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn(), empFn());
+    expect(res).not.toBeNull();
+    expect(res!.direction).toBe('gain_larger_than_expected');
+    expect(res!.suggestedAdjustment).toBeGreaterThan(0);
+  });
+
+  it('flags gain despite deficit', () => {
+    const entries = buildEntries({ calories: 2000, weightStep: 0.02 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn({ maintenanceCalories: 2500, confidenceInterval: [2400, 2600] }), empFn());
+    expect(res).not.toBeNull();
+    expect(res!.direction).toBe('gain_despite_deficit');
+    expect(res!.suggestedAdjustment).toBeGreaterThan(0);
+  });
+
+  it('flags loss despite surplus', () => {
+    const entries = buildEntries({ calories: 2800, weightStep: -0.02 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn({ maintenanceCalories: 2500, confidenceInterval: [2400, 2600] }), empFn());
+    expect(res).not.toBeNull();
+    expect(res!.direction).toBe('loss_despite_surplus');
+    expect(res!.suggestedAdjustment).toBeLessThan(0);
+  });
+
+  it('flags loss larger than expected', () => {
+    const entries = buildEntries({ calories: 2300, weightStep: -0.05 });
+    const res = computeIntakeNotice(entries as any, 0.95, inferenceFn({ maintenanceCalories: 2500, confidenceInterval: [2200, 2600] }), empFn());
+    expect(res).not.toBeNull();
+    expect(res!.direction).toBe('loss_larger_than_expected');
+  });
+});
+
+describe('calculateEmpiricalKcalPerKgHelper', () => {
+  const conf: 0.95 = 0.95;
+
+  function dated(dayOffset: number) {
+    const base = new Date('2024-01-01');
+    base.setDate(base.getDate() + dayOffset);
+    return base.toISOString().split('T')[0];
+  }
+
+  it('returns stable estimate with narrow CI when data are consistent', () => {
+    const entries: TestEntry[] = [
+      { date: dated(0), weight: 70, calories: 2300 },
+      { date: dated(2), weight: 70.4, calories: 2600 }, // +0.4 kg in 2d, avg 2450
+      { date: dated(4), weight: 70.9, calories: 2900 }  // +0.5 kg in 2d, avg 2750
+    ];
+    const res = calculateEmpiricalKcalPerKgHelper(entries as any, conf);
+    expect(res.empirical).not.toBeNull();
+    expect(res.empiricalCI).not.toBeNull();
+    expect(res.stability).toBe('stable');
+    expect(res.intervals).toBeGreaterThanOrEqual(3);
+  });
+
+  it('returns insufficient when intervals are too few', () => {
+    const entries: TestEntry[] = [
+      { date: dated(0), weight: 70, calories: 2500 },
+      { date: dated(1), weight: 70.1, calories: 2550 }
+    ];
+    const res = calculateEmpiricalKcalPerKgHelper(entries as any, conf);
+    expect(res.empirical).toBeNull();
+    expect(res.stability).toBe('insufficient');
+  });
+
+  it('marks noisy when CI is very wide', () => {
+    // Small slope, varying calories -> wide CI
+    const entries: TestEntry[] = [
+      { date: dated(0), weight: 70, calories: 2000 },
+      { date: dated(3), weight: 70.05, calories: 2600 },
+      { date: dated(6), weight: 70.1, calories: 3200 }
+    ];
+    const res = calculateEmpiricalKcalPerKgHelper(entries as any, conf);
+    expect(res.stability === 'noisy' || res.stability === 'insufficient').toBe(true);
+  });
+
+  it('returns insufficient when slope CI crosses zero', () => {
+    // Weight flat while calories vary -> slope ~0
+    const entries: TestEntry[] = [
+      { date: dated(0), weight: 70, calories: 2000 },
+      { date: dated(2), weight: 70, calories: 2500 },
+      { date: dated(4), weight: 70, calories: 3000 }
+    ];
+    const res = calculateEmpiricalKcalPerKgHelper(entries as any, conf);
+    expect(res.stability).toBe('insufficient');
+    expect(res.empiricalCI).toBeNull();
   });
 });

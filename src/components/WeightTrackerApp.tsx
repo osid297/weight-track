@@ -1,10 +1,9 @@
-import React, { useState, useMemo, ChangeEvent, useEffect } from 'react';
+﻿import React, { useState, useMemo, ChangeEvent, useEffect } from 'react';
 import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area } from 'recharts';
-
 interface WeightEntry {
   date: string;
   weight: number;
@@ -56,6 +55,178 @@ interface CaloricInference {
   trendData: Array<{ date: string; weight: number; predicted: number; predictedLow: number; predictedHigh: number; predictedRange: number }>;
 }
 
+export type IntakeNoticeDirection =
+  | 'gain_larger_than_expected'
+  | 'gain_despite_deficit'
+  | 'loss_despite_surplus'
+  | 'loss_larger_than_expected';
+
+export interface IntakeSanityNotice {
+  windowDays: number;
+  avgCalories: number;
+  expectedChange: number;
+  expectedCILow: number;
+  expectedCIHigh: number;
+  observedChange: number;
+  suggestedAdjustment: number;
+  direction: IntakeNoticeDirection;
+}
+
+export function calculateEmpiricalKcalPerKgHelper(
+  entries: WeightEntry[],
+  conf: ConfidenceLevel
+): {
+  empirical: number | null;
+  maintenance: number | null;
+  r2: number | null;
+  intervals: number;
+  empiricalCI: [number, number] | null;
+  stability: Stability;
+} {
+  const pairs: { calories: number; weightRate: number }[] = [];
+
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const curr = sorted[i];
+    if (typeof curr.calories !== 'number') continue;
+    for (let j = i + 1; j < sorted.length; j++) {
+      const next = sorted[j];
+      if (typeof next.calories !== 'number') continue;
+      const days = (new Date(next.date).getTime() - new Date(curr.date).getTime()) / DAY_MS;
+      if (days <= 0) continue;
+      const weightRate = (next.weight - curr.weight) / days; // kg per day
+      const avgCalories = (curr.calories + next.calories) / 2; // kcal/day
+      pairs.push({ calories: avgCalories, weightRate });
+    }
+  }
+
+  const intervals = pairs.length;
+  if (intervals < 3) return { empirical: null, maintenance: null, r2: null, intervals, empiricalCI: null, stability: 'insufficient' };
+
+  const x = pairs.map(p => p.calories);
+  const y = pairs.map(p => p.weightRate);
+
+  const n = x.length;
+  const sumX = x.reduce((s, v) => s + v, 0);
+  const sumY = y.reduce((s, v) => s + v, 0);
+  const sumXY = x.reduce((s, v, idx) => s + v * y[idx], 0);
+  const sumXX = x.reduce((s, v) => s + v * v, 0);
+
+  const denominator = n * sumXX - sumX * sumX;
+  if (denominator === 0) return { empirical: null, maintenance: null, r2: null, intervals, empiricalCI: null, stability: 'insufficient' };
+
+  const slope = (n * sumXY - sumX * sumY) / denominator; // kg/day per kcal/day
+  if (slope === 0) return { empirical: null, maintenance: null, r2: null, intervals, empiricalCI: null, stability: 'insufficient' };
+
+  const intercept = (sumY - slope * sumX) / n;
+
+  const meanY = sumY / n;
+  const ssTot = y.reduce((s, v) => s + (v - meanY) ** 2, 0);
+  const ssRes = y.reduce((s, v, idx) => s + (v - (slope * x[idx] + intercept)) ** 2, 0);
+  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+
+  const sxx = sumXX - (sumX ** 2) / n;
+  if (sxx === 0 || n < 3) return { empirical: null, maintenance: null, r2, intervals, empiricalCI: null, stability: 'insufficient' };
+  const mse = ssRes / (n - 2);
+  const slopeSE = Math.sqrt(mse / sxx);
+  const z = zScores[conf];
+  const slopeCI: [number, number] = [slope - z * slopeSE, slope + z * slopeSE];
+
+  const empirical = Math.abs(1 / slope);
+  const maintenance = -intercept / slope;
+
+  let empiricalCI: [number, number] | null = null;
+  let stability: Stability = 'stable';
+  if (slopeCI[0] <= 0 && slopeCI[1] >= 0) {
+    stability = 'insufficient';
+  } else {
+    const c1 = Math.abs(1 / slopeCI[0]);
+    const c2 = Math.abs(1 / slopeCI[1]);
+    empiricalCI = [Math.min(c1, c2), Math.max(c1, c2)];
+    const relWidth = empiricalCI[1] / empiricalCI[0];
+    if (relWidth > 3 || (r2 !== null && r2 < 0.2)) {
+      stability = 'noisy';
+    }
+  }
+
+  return { empirical, maintenance, r2, intervals, empiricalCI, stability };
+}
+
+export function computeIntakeNotice(
+  entries: WeightEntry[],
+  confidence: ConfidenceLevel,
+  calculateCaloricInferenceFn: (entries: WeightEntry[], conf: ConfidenceLevel) => CaloricInference | null,
+  calculateEmpiricalKcalPerKgFn: (entries: WeightEntry[]) => {
+    empirical: number | null;
+    maintenance: number | null;
+    r2: number | null;
+    intervals: number;
+  }
+): IntakeSanityNotice | null {
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+  if (sorted.length < MIN_WEIGHT_POINTS) return null;
+  const last = new Date(sorted[sorted.length - 1].date);
+  const cutoff = new Date(last.getTime() - (INTAKE_CHECK_DAYS - 1) * DAY_MS);
+  const windowEntries = sorted.filter(e => new Date(e.date) >= cutoff);
+  if (windowEntries.length < MIN_WEIGHT_POINTS) return null;
+
+  const withCalories = windowEntries.filter(e => typeof e.calories === 'number');
+  if (withCalories.length < MIN_CALORIE_POINTS) return null;
+
+  const firstWeight = windowEntries[0].weight;
+  const lastWeight = windowEntries[windowEntries.length - 1].weight;
+  const observedChange = lastWeight - firstWeight;
+
+  const inference = calculateCaloricInferenceFn(windowEntries, confidence);
+  const emp = calculateEmpiricalKcalPerKgFn(windowEntries);
+  if (!inference || emp.empirical === null || inference.confidenceInterval[0] <= 0 || inference.confidenceInterval[1] <= 0) return null;
+  if (emp.r2 !== null && emp.r2 < 0.3) return null; // too noisy
+
+  const avgCalories = withCalories.reduce((sum, e) => sum + (e.calories as number), 0) / withCalories.length;
+  const maintenance = inference.maintenanceCalories;
+  const kcalPerKg = emp.empirical;
+
+  const days = Math.max(1, Math.round((new Date(windowEntries[windowEntries.length - 1].date).getTime() - new Date(windowEntries[0].date).getTime()) / DAY_MS));
+  const expectedChange = ((avgCalories - maintenance) * days) / kcalPerKg;
+
+  // Crude CI: use maintenance CI and assume kcal/kg stable
+  const maintenanceCI = inference.confidenceInterval;
+  const expectedLow = ((avgCalories - maintenanceCI[1]) * days) / kcalPerKg;
+  const expectedHigh = ((avgCalories - maintenanceCI[0]) * days) / kcalPerKg;
+  const expectedCILow = Math.min(expectedLow, expectedHigh);
+  const expectedCIHigh = Math.max(expectedLow, expectedHigh);
+
+  const diff = observedChange - expectedChange;
+  if (Math.abs(diff) < MIN_DELTA_KG) return null;
+  if (observedChange >= expectedCILow && observedChange <= expectedCIHigh) return null; // within CI
+
+  // Direction logic
+  let direction: IntakeNoticeDirection;
+  if (expectedChange >= 0 && observedChange < 0) {
+    direction = 'loss_despite_surplus';
+  } else if (expectedChange < 0 && observedChange > 0) {
+    direction = 'gain_despite_deficit';
+  } else if (expectedChange >= 0 && observedChange > expectedCIHigh) {
+    direction = 'gain_larger_than_expected';
+  } else {
+    direction = 'loss_larger_than_expected';
+  }
+
+  // Suggested adjustment: spread diff over the window, convert to kcal/day
+  const suggestedAdjustment = Math.round((diff * kcalPerKg) / days);
+
+  return {
+    windowDays: days,
+    avgCalories: Math.round(avgCalories),
+    expectedChange,
+    expectedCILow,
+    expectedCIHigh,
+    observedChange,
+    suggestedAdjustment,
+    direction
+  };
+}
+
 type ConfidenceLevel = 0.80 | 0.90 | 0.95 | 0.99;
 
 const zScores = {
@@ -71,7 +242,10 @@ const MIN_DAYS_FOR_INFERENCE = 14; // Minimum days of data needed for inference
 const DAY_MS = 24 * 60 * 60 * 1000;
 type TrendWindowOption = 14 | 30 | 60 | 'all';
 type StatsGroupingOption = '1w' | '2w' | '1m' | '2m';
-
+const INTAKE_CHECK_DAYS = 30;
+const MIN_WEIGHT_POINTS = 10;
+const MIN_CALORIE_POINTS = 7;
+const MIN_DELTA_KG = 0.5;
 // Add new interfaces for body composition tracking
 interface BodyCompositionEstimate {
   date: string;
@@ -89,6 +263,8 @@ interface CalibrationFactor {
   muscleGainFactor: number; // How efficiently this person gains muscle in a surplus
   fatLossFactor: number;    // How efficiently this person loses fat in a deficit  
 }
+
+export type Stability = 'stable' | 'noisy' | 'insufficient';
 
 // Define the phase type
 type SimulationPhase = {
@@ -218,6 +394,7 @@ export default function WeightTrackerApp() {
     muscleGainFactor: 0.3, // Default: 30% of surplus goes to muscle in a surplus
     fatLossFactor: 0.9     // Default: 90% of deficit comes from fat in a deficit
   });
+  const [intakeNotice, setIntakeNotice] = useState<IntakeSanityNotice | null>(null);
 
   // Persist entries
   useEffect(() => {
@@ -309,8 +486,9 @@ export default function WeightTrackerApp() {
 
     // Deduplicate by date (last-write-wins)
     const filtered = entries.filter(e => e.date !== date);
-    const newEntries = [...filtered, newEntry];
-    setEntries(newEntries.sort((a, b) => a.date.localeCompare(b.date)));
+    const newEntries = [...filtered, newEntry].sort((a, b) => a.date.localeCompare(b.date));
+    setEntries(newEntries);
+    handleIntakeNotice(newEntries);
     setDate('');
     setWeight('');
     setCalories('');
@@ -318,6 +496,10 @@ export default function WeightTrackerApp() {
 
   const removeEntry = (index: number) => {
     setEntries((prev: WeightEntry[]) => prev.filter((_: WeightEntry, i: number) => i !== index));
+  };
+  const handleIntakeNotice = (newEntries: WeightEntry[]) => {
+    const notice = computeIntakeNotice(newEntries, confidence, calculateCaloricInference, calculateEmpiricalKcalPerKg);
+    setIntakeNotice(notice);
   };
 
   const weeklyGroups = useMemo(() => {
@@ -413,7 +595,7 @@ export default function WeightTrackerApp() {
     const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
     const intercept = (sumY - slope * sumX) / n;
 
-    // Calculate R²
+    // Calculate R^2
     const yMean = sumY / n;
     const ssTot = y.reduce((a, b) => a + Math.pow(b - yMean, 2), 0);
     const ssRes = y.reduce((a, b, i) => a + Math.pow(b - (slope * x[i] + intercept), 2), 0);
@@ -752,7 +934,7 @@ export default function WeightTrackerApp() {
           const empiricalRes = calculateEmpiricalKcalPerKg(entries);
           const kcalPerKgUsed = empiricalRes.empirical || 7700;
 
-          // 3. Convert kcal/kg to fat-fraction (0 → all lean, 1 → all fat)
+          // 3. Convert kcal/kg to fat-fraction (0 -> all lean, 1 -> all fat)
           const { fatPct } = getFatLeanPercent(kcalPerKgUsed, [kcalPerKgUsed, kcalPerKgUsed]);
           const leanPct = 1 - fatPct;
 
@@ -765,8 +947,8 @@ export default function WeightTrackerApp() {
           currentLeanMass += leanMassChange;
 
           // Minimum physiological safety bounds
-          currentFatMass  = Math.max(entry.weight * 0.03, currentFatMass);  // ≥3 % BF
-          currentLeanMass = Math.max(entry.weight * 0.5,  currentLeanMass); // ≥50 % lean
+          currentFatMass  = Math.max(entry.weight * 0.03, currentFatMass);  // >=3 % BF
+          currentLeanMass = Math.max(entry.weight * 0.5,  currentLeanMass); // >=50 % lean
 
           // 6. New BF% and rolling CI (uncertainty widens with time since last true measurement)
           const bodyFatPercentage = (currentFatMass / entry.weight) * 100;
@@ -846,58 +1028,8 @@ export default function WeightTrackerApp() {
   // Helper: Empirical kcal/kg via regression of weight change vs calories (no BMR/activity assumptions)
   
   // Helper: Empirical kcal/kg via regression of weight change vs calories (no BMR/activity assumptions)
-  function calculateEmpiricalKcalPerKg(entries: WeightEntry[]): {
-    empirical: number | null;
-    maintenance: number | null;
-    r2: number | null;
-    intervals: number;
-  } {
-    const pairs: { calories: number; weightRate: number }[] = [];
-
-    const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const curr = sorted[i];
-      if (typeof curr.calories !== 'number') continue;
-      for (let j = i + 1; j < sorted.length; j++) {
-        const next = sorted[j];
-        if (typeof next.calories !== 'number') continue;
-        const days = (new Date(next.date).getTime() - new Date(curr.date).getTime()) / DAY_MS;
-        if (days <= 0) continue;
-        const weightRate = (next.weight - curr.weight) / days; // kg per day
-        const avgCalories = (curr.calories + next.calories) / 2; // kcal/day
-        pairs.push({ calories: avgCalories, weightRate });
-      }
-    }
-
-    const intervals = pairs.length;
-    if (intervals < 3) return { empirical: null, maintenance: null, r2: null, intervals };
-
-    const x = pairs.map(p => p.calories);
-    const y = pairs.map(p => p.weightRate);
-
-    const n = x.length;
-    const sumX = x.reduce((s, v) => s + v, 0);
-    const sumY = y.reduce((s, v) => s + v, 0);
-    const sumXY = x.reduce((s, v, idx) => s + v * y[idx], 0);
-    const sumXX = x.reduce((s, v) => s + v * v, 0);
-
-    const denominator = n * sumXX - sumX * sumX;
-    if (denominator === 0) return { empirical: null, maintenance: null, r2: null, intervals };
-
-    const slope = (n * sumXY - sumX * sumY) / denominator; // kg/day per kcal/day
-    if (slope === 0) return { empirical: null, maintenance: null, r2: null, intervals };
-
-    const intercept = (sumY - slope * sumX) / n;
-
-    const meanY = sumY / n;
-    const ssTot = y.reduce((s, v) => s + (v - meanY) ** 2, 0);
-    const ssRes = y.reduce((s, v, idx) => s + (v - (slope * x[idx] + intercept)) ** 2, 0);
-    const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
-
-    const empirical = Math.abs(1 / slope);
-    const maintenance = -intercept / slope;
-
-    return { empirical, maintenance, r2, intervals };
+  function calculateEmpiricalKcalPerKg(entries: WeightEntry[], conf: ConfidenceLevel = confidence) {
+    return calculateEmpiricalKcalPerKgHelper(entries, conf);
   }
 
 // Build interval pairs for calories vs weight-rate scatter plot
@@ -912,7 +1044,7 @@ export default function WeightTrackerApp() {
       if (days <= 0) continue;
       const weightRate = (next.weight - curr.weight) / days;
       const avgCalories = (curr.calories + next.calories) / 2;
-      pairs.push({ avgCalories, weightRate, label: `${curr.date} → ${next.date}` });
+      pairs.push({ avgCalories, weightRate, label: `${curr.date} -> ${next.date}` });
     }
     return pairs;
   }, [entries]);
@@ -938,6 +1070,34 @@ export default function WeightTrackerApp() {
           <p className="text-xs text-gray-500">Take a new BF% to tighten composition</p>
         </div>
       </div>
+
+      {intakeNotice && (
+        <div className="bg-yellow-50 border border-yellow-200 text-yellow-900 rounded-lg p-3 sm:p-4 shadow-sm space-y-2">
+          <div className="font-semibold text-sm sm:text-base">Intake sanity check</div>
+          <div className="text-sm leading-snug">
+            {(() => {
+              const dir = intakeNotice.direction;
+              const exp = intakeNotice.expectedChange;
+              const obs = intakeNotice.observedChange;
+              const adj = Math.abs(intakeNotice.suggestedAdjustment);
+              if (dir === 'gain_despite_deficit') {
+                return `Past ${intakeNotice.windowDays}d: avg ${intakeNotice.avgCalories} kcal. Expected ${exp.toFixed(1)} kg loss; observed ${obs.toFixed(1)} kg gain -> gain despite logged deficit. Consider reducing ~${adj} kcal/day.`;
+              }
+              if (dir === 'loss_despite_surplus') {
+                return `Past ${intakeNotice.windowDays}d: avg ${intakeNotice.avgCalories} kcal. Expected ${exp.toFixed(1)} kg gain; observed ${obs.toFixed(1)} kg loss -> loss despite logged surplus. Consider adding ~${adj} kcal/day.`;
+              }
+              if (dir === 'gain_larger_than_expected') {
+                return `Past ${intakeNotice.windowDays}d: avg ${intakeNotice.avgCalories} kcal. Expected ${exp.toFixed(1)} kg gain; observed ${obs.toFixed(1)} kg gain -> gain larger than expected. Consider reducing ~${adj} kcal/day.`;
+              }
+              return `Past ${intakeNotice.windowDays}d: avg ${intakeNotice.avgCalories} kcal. Expected ${exp.toFixed(1)} kg loss; observed ${obs.toFixed(1)} kg loss -> loss larger than expected. Consider adding ~${adj} kcal/day.`;
+            })()}
+          </div>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setIntakeNotice(null)}>Dismiss</Button>
+            <Button size="sm" onClick={() => setIntakeNotice(null)}>Continue anyway</Button>
+          </div>
+        </div>
+      )}
       <Card className="p-2 sm:p-4 md:p-6 shadow-lg rounded-2xl border border-gray-200">
         <CardContent className="space-y-4">
           <div className="flex flex-col sm:flex-row justify-between items-center gap-2 sm:gap-0">
@@ -948,7 +1108,7 @@ export default function WeightTrackerApp() {
               onClick={() => {
                 if (!window.confirm('This will overwrite all your current entries. Are you sure you want to simulate data?')) return;
                 
-                // REALISTIC BULKING JOURNEY: 60kg → 75kg over 1.5 years
+                // REALISTIC BULKING JOURNEY: 60kg -> 75kg over 1.5 years
                 
                 // Parameters
                 const startDate = new Date('2023-01-01');
@@ -1106,7 +1266,7 @@ export default function WeightTrackerApp() {
                   if (bodyFatMeasurementMonths.includes(monthsSinceStart) && 
                       !bodyMeasurements.some(m => Math.abs(new Date(m.date).getTime() - currentDate.getTime()) < 15 * 24 * 60 * 60 * 1000)) {
                     // Add slight measurement error for realism
-                    const measurementError = ((Math.random() * 2) - 1) * 0.5; // ±0.5%
+                    const measurementError = ((Math.random() * 2) - 1) * 0.5; // +/-0.5%
                     bodyMeasurements.push({
                       date: currentDate.toISOString().split('T')[0],
                       bodyFat: Math.round((currentBodyFat + measurementError) * 10) / 10
@@ -1183,7 +1343,7 @@ export default function WeightTrackerApp() {
                 rel="noopener noreferrer" 
                 className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-md hover:bg-blue-200 transition-colors"
               >
-                Calculator ↗
+                Calculator ->
               </a>
             </h3>
             <div className="flex flex-col md:flex-row gap-2 md:gap-4">
@@ -1284,7 +1444,7 @@ export default function WeightTrackerApp() {
                 rel="noopener noreferrer" 
                 className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-md hover:bg-blue-200 transition-colors"
               >
-                Ideal Calculator ↗
+                Ideal Calculator ->
               </a>
             </h3>
             
@@ -1373,7 +1533,7 @@ export default function WeightTrackerApp() {
                         {(() => {
                           const latest = getLatestMeasurementValue(part);
                           if (typeof latest !== 'number') {
-                            return 'Latest: —';
+                            return 'Latest: -';
                           }
                           return `Latest: ${latest.toFixed(1)} cm`;
                         })()}
@@ -1953,7 +2113,12 @@ export default function WeightTrackerApp() {
               const avgIntake = getAverageIntake(entries);
 
               // Purely data-driven empirical kcal/kg (no BMR/activity assumptions)
-              const { empirical: empiricalKcalPerKg, maintenance: maintenanceEmpirical } = calculateEmpiricalKcalPerKg(entries);
+              const {
+                empirical: empiricalKcalPerKg,
+                empiricalCI: empiricalKcalPerKgCI,
+                stability: empiricalStability,
+                maintenance: maintenanceEmpirical
+              } = calculateEmpiricalKcalPerKg(entries);
 
               // Use empirical kcal/kg for surplus/deficit if available, else fall back to 7700
               const kcalPerKgUsed = empiricalKcalPerKg || KCAL_PER_KG;
@@ -1989,75 +2154,65 @@ export default function WeightTrackerApp() {
                       {empiricalKcalPerKg && (
                         <p className="text-xl font-bold text-green-700">Empirical: {empiricalKcalPerKg.toFixed(0)} kcal/kg</p>
                       )}
+                      <p className="text-sm text-gray-600 mt-1">
+                        95% CI:{' '}
+                        {empiricalKcalPerKgCI
+                          ? `${empiricalKcalPerKgCI[0].toFixed(0)}-${empiricalKcalPerKgCI[1].toFixed(0)}`
+                          : 'n/a'}
+                        <span
+                          className={`ml-2 px-2 py-0.5 rounded-full text-xs ${
+                            empiricalStability === 'stable'
+                              ? 'bg-green-100 text-green-800'
+                              : empiricalStability === 'noisy'
+                              ? 'bg-yellow-100 text-yellow-800'
+                              : 'bg-gray-200 text-gray-700'
+                          }`}
+                        >
+                          {empiricalStability}
+                        </span>
+                      </p>
                       <p className="text-xs text-gray-500 mt-2">
                         Standard is the physiological average. Empirical is calculated from your own data (if enough calorie entries).
                       </p>
                       
                       {/* More detailed explanation */}
                       <div className="text-sm text-gray-600 mt-3 border-t border-gray-200 pt-2 space-y-2">
-                        <p>
-                          <span className="font-semibold">Interpreting your number:</span>
-                          <ul className="list-disc pl-5 mt-1 space-y-2 text-sm">
-                            {/* ───── Close to 7700 */}
-                            <li>
-                              <span className="italic font-medium">Close&nbsp;to&nbsp;7700&nbsp;kcal/kg&nbsp;(≈&nbsp;6.5–8.5&nbsp;k)</span>
-                              <ul className="list-circle pl-4 mt-1 space-y-1">
-                                <li>Weight-change energy ≈ chemical energy in fat.</li>
-                                <li>Bulking – most of the gain is body-fat <span className="text-xs">(depends on goals)</span>.</li>
-                                <li>Cutting – most of the loss is body-fat <span className="text-xs">(ideal)</span>.</li>
-                                <li className="text-gray-500">Caveats: logging likely accurate. No immediate action required.</li>
-                              </ul>
-                            </li>
-
-                            {/* ───── Lower than 7700 */}
-                            <li>
-                              <span className="italic font-medium">Lower&nbsp;than&nbsp;7700&nbsp;kcal/kg</span>
-                              <ul className="list-circle pl-4 mt-1 space-y-1">
-                                <li>Bulking – part of the gain is muscle, water, or glycogen (all "cheaper" in kcal).</li>
-                                <li className="text-gray-500">Caveats: possible calorie under-reporting or large scale noise.</li>
-                                <li>Cutting – dropping kg faster than the deficit alone predicts (water/glycogen dump or muscle loss).</li>
-                                <li className="text-gray-500">Caveats: calories may be over-estimated.</li>
-                                <li className="font-semibold">Action check:</li>
-                                <li className="pl-4 list-disc">
-                                  • Bulking – good up to a point; monitor body-fat %.
-                                </li>
-                                <li className="pl-4 list-disc">
-                                  • Cutting – beware muscle loss; moderate deficit, keep protein &amp; training, ensure accurate logging.
-                                </li>
-                              </ul>
-                            </li>
-
-                            {/* ───── Higher than 7700 */}
-                            <li>
-                              <span className="italic font-medium">Higher&nbsp;than&nbsp;7700&nbsp;kcal/kg</span>
-                              <ul className="list-circle pl-4 mt-1 space-y-1">
-                                <li>Bulking – much of the surplus is being burned; body is less efficient at adding mass.</li>
-                                <li className="text-gray-500">Caveats: calorie over-reporting or hidden water loss can inflate the figure.</li>
-                                <li>Cutting – you need a bigger deficit per kg lost (strong fat-biased loss or metabolic adaptation).</li>
-                                <li className="text-gray-500">Caveats: could also be calorie under-reporting.</li>
-                                <li className="font-semibold">Action check:</li>
-                                <li className="pl-4 list-disc">
-                                  • Bulking – tighten calorie tracking; if gains are slow &amp; kcal/kg sky-high, reduce surplus and focus on progressive overload.
-                                </li>
-                                <li className="pl-4 list-disc">
-                                  • Cutting – great if strength is stable &amp; body-fat % falling; otherwise re-audit intake/expenditure.
-                                </li>
-                              </ul>
-                            </li>
-                          </ul>
-
-                          {/* Sanity reminders */}
-                          <div className="mt-3 text-xs space-y-1 text-gray-500">
-                            <p><strong>Sanity reminders</strong></p>
-                            <ul className="list-disc pl-5 space-y-1">
-                              <li>Water &amp; glycogen can swing weight ±1–2&nbsp;kg in days, distorting short spans.</li>
-                              <li>Regression needs multiple calorie + weight pairs; sparse data → wide confidence bands.</li>
-                              <li>Logging accuracy dominates: scale error, un-weighed food, skipped days, etc.</li>
-                              <li>Treat the number as a trend indicator, not an exact thermodynamic truth.</li>
-                              <li>Combine it with body-fat %, tape measures &amp; gym performance to judge progress quality.</li>
-                            </ul>
-                          </div>
-                        </p>
+                        <p className="font-semibold">What is kcal/kg?</p>
+                        <p>Energy per kg of weight change from your own calorie+weight trend. Lower = "cheaper" scale movement (more lean/glycogen/water or over-logged calories). Higher = "more expensive" (more fat per kg or under-logged calories / higher expenditure).</p>
+                        <p className="font-semibold">Confidence &amp; stability</p>
+                        <ul className="list-disc pl-5 space-y-1">
+                          <li>Shown as: Empirical: 9,200 kcal/kg (95% CI 7,800-10,800) - stable/noisy/insufficient.</li>
+                          <li>Stable: enough calorie-weight pairs, slope CI doesn't cross 0, CI not huge.</li>
+                          <li>Noisy: wide CI or marginal fit - treat cautiously.</li>
+                          <li>Insufficient: slope CI crosses 0 or too few intervals - log more daily calories/weights or extend to 60d.</li>
+                        </ul>
+                        <p className="font-semibold">How to read it (when stable)</p>
+                        <ul className="list-disc pl-5 space-y-2">
+                          <li>
+                            ~6.5-8.5k: Normal fat-energy range.<br />
+                            <span className="pl-2 block">Bulking: more fat gain (okay if goal, but monitor BF%).</span>
+                            <span className="pl-2 block">Cutting: fat-dominant loss (ideal).</span>
+                          </li>
+                          <li>
+                            ~4.5-6k: "Cheap" kg.<br />
+                            <span className="pl-2 block">Bulking: more lean/glycogen per kg (ideal).</span>
+                            <span className="pl-2 block">Cutting: could be water/glycogen/muscle (concerning); keep protein/training, avoid aggresive deficit, check body comp/strength loss.</span>
+                          </li>
+                          <li>
+                            ~9-12k: "Expensive" kg.<br />
+                            <span className="pl-2 block">Bulking: slow gain per kcal; logging is accurrate but imprecise; consider maintenace drinft (bump surplus), watch BF%.</span>
+                            <span className="pl-2 block">Cutting: slow loss per kcal; check sodium/water, logging, possible higher maintenance.</span>
+                          </li>
+                          <li>
+                            ~10.8-14.3k: Stable but certainly inefficient.<br />
+                            <span className="pl-2 block">If logging is accurate, could strongly suggest higher expenditure/adaptive thermogenesis; otherwise suspect calorie misestimation or consider if you have been maintaining weight in specified time period.</span>
+                            <span className="pl-2 block">Insights: bulking; surplus too small/lean-heavy, cutting; deficit smaller than logged).</span>
+                          </li>
+                        </ul>
+                        <p className="font-semibold pt-1">Noisy but usable</p>
+                        <p>Signal exists but band is wide. Check R^2 and weight trend direction for a better insight; improve logging, extend to 60d before acting.</p>
+                        <p className="font-semibold pt-1">Insufficient signal</p>
+                        <p>Empirical hidden or "n/a": slope CI crosses zero or too few calorie days. Log more daily calories/weights, then revisit.</p>
                       </div>
                     </div>
                   </div>
@@ -2080,10 +2235,17 @@ export default function WeightTrackerApp() {
                           <span className="font-semibold">What is "Surplus / Deficit"?</span>
                           <ul className="list-disc pl-5 mt-1 space-y-1">
                             <li>It's the energy gap between what you <em>eat</em> and what you <em>burn</em> each day.</li>
-                            <li>Positive → eating above maintenance, weight tends to rise.</li>
-                            <li>Negative → eating below maintenance, weight tends to fall.</li>
+                            <li>Positive -> eating above maintenance, weight tends to rise.</li>
+                            <li>Negative -> eating below maintenance, weight tends to fall.</li>
                           </ul>
-                          <span className="text-xs block mt-1">Formula: <code>Weight-Change&nbsp;Rate&nbsp;(kg/day) × {(empiricalKcalPerKg ? empiricalKcalPerKg.toFixed(0) : '7700')}&nbsp;kcal/kg</code></span>
+                          <span className="text-xs block mt-1">
+                            Formula:{' '}
+                            <code>
+                              Weight-Change&nbsp;Rate&nbsp;(kg/day) *{' '}
+                              {(empiricalKcalPerKg ? empiricalKcalPerKg.toFixed(0) : '7700')}
+                              &nbsp;kcal/kg
+                            </code>
+                          </span>
                         </div>
 
                         {/* Empirical maintenance */}
@@ -2091,18 +2253,18 @@ export default function WeightTrackerApp() {
                           <span className="font-semibold">What is "Empirical Maintenance"?</span>
                           <ul className="list-disc pl-5 mt-1 space-y-1">
                             <li>Your personalised Total Daily Energy Expenditure (TDEE).</li>
-                            <li>Derived straight from your own calorie logs &amp; weight trend—no BMR or activity guesses.</li>
+                            <li>Derived straight from your own calorie logs &amp; weight trend - no BMR or activity guesses.</li>
                           </ul>
-                          <span className="text-xs block mt-1">Formula: <code>Average Calories Logged − Surplus/Deficit</code></span>
+                          <span className="text-xs block mt-1">Formula: <code>Average Calories Logged - Surplus/Deficit</code></span>
                         </div>
 
                         {/* How to use */}
                         <div>
                           <span className="font-semibold">How to use these numbers</span>
                           <ul className="list-disc pl-5 mt-1 space-y-1">
-                            <li>Maintain → eat ~ your Empirical Maintenance.</li>
-                            <li>Lose fat → eat 300-500 kcal <em>below</em> it.</li>
-                            <li>Gain muscle → eat 300-500 kcal <em>above</em> it.</li>
+                            <li>Maintain -> eat ~ your Empirical Maintenance.</li>
+                            <li>Lose fat -> eat 300-500 kcal <em>below</em> it.</li>
+                            <li>Gain muscle -> eat 300-500 kcal <em>above</em> it.</li>
                           </ul>
                           <p className="mt-1 text-xs">The model updates continuously; as your body weight changes, so does your maintenance.</p>
                         </div>
@@ -2112,7 +2274,7 @@ export default function WeightTrackerApp() {
                       <h3 className="text-lg font-medium text-gray-800 mb-2">Data Quality</h3>
                       <div className="space-y-2">
                         <div>
-                          <p className="text-sm text-gray-600">R² (Fit Quality)</p>
+                          <p className="text-sm text-gray-600">R^2 (Fit Quality)</p>
                           <p className="text-xl font-bold text-gray-900">
                             {(inference.r2 * 100).toFixed(1)}%
                           </p>
@@ -2156,30 +2318,30 @@ export default function WeightTrackerApp() {
                       
                       {/* Add user-friendly explanation */}
                       <div className="text-sm text-gray-600 mt-3 border-t border-gray-200 pt-2 space-y-2">
-                        <p><span className="font-semibold">What is R²?</span></p>
+                        <p><span className="font-semibold">What is R^2?</span></p>
                         <p>Statistical "goodness-of-fit" from the linear regression between days and weight.</p>
 
                         <p><span className="font-semibold">Assumptions &amp; Caveats</span></p>
                         <ul className="list-disc pl-5 space-y-1">
-                          <li>All the model is saying is this: your weight should respond to what you're eating—because physics.</li>
+                          <li>All the model is saying is this: your weight should respond to what you're eating - because physics.</li>
                           <li>If it doesn't respond, either logging is off or the model's linear assumption is too short-term. Usually it's logging.</li>
-                          <li>Large water swings, illness or missed logs add noise and pull R² down.</li>
-                          <li>A high R² doesn't prove causation; it only shows the trend is clear.</li>
+                          <li>Large water swings, illness or missed logs add noise and pull R^2 down.</li>
+                          <li>A high R^2 doesn't prove causation; it only shows the trend is clear.</li>
                         </ul>
 
                         <p><span className="font-semibold">How to read it</span></p>
                         <ul className="list-disc pl-5 space-y-1">
-                          <li>&lt; 50 % – Trend is weak / data noisy. Daily fluctuations dominate.</li>
-                          <li>50–70 % – Moderate trend. Keep logging to firm things up.</li>
-                          <li>&gt; 70 % – Strong, reliable trend. Confidence bands are tight.</li>
+                          <li>&lt; 50 % - Trend is weak / data noisy. Daily fluctuations dominate.</li>
+                          <li>50-70 % - Moderate trend. Keep logging to firm things up.</li>
+                          <li>&gt; 70 % - Strong, reliable trend. Confidence bands are tight.</li>
                         </ul>
-                        <p className="pl-5 text-xs">More days → better R² and narrower confidence intervals (if logging stays consistent).</p>
+                        <p className="pl-5 text-xs">More days -> better R^2 and narrower confidence intervals (if logging stays consistent).</p>
 
                         <p><span className="font-semibold">Why you should care</span></p>
                         <ul className="list-disc pl-5 space-y-1">
-                          <li>High R² → kcal/kg and maintenance estimates are trustworthy.</li>
-                          <li>Low R² → prioritise consistent weighing &amp; calorie logging before drastic diet changes.</li>
-                          <li>Watch R² over time—if it suddenly drops, something in your routine or logging probably changed.</li>
+                          <li>High R^2 -> kcal/kg and maintenance estimates are trustworthy.</li>
+                          <li>Low R^2 -> prioritise consistent weighing &amp; calorie logging before drastic diet changes.</li>
+                          <li>Watch R^2 over time - if it suddenly drops, something in your routine or logging probably changed.</li>
                         </ul>
                       </div>
                     </div>
@@ -2257,7 +2419,7 @@ export default function WeightTrackerApp() {
                       <ul className="list-disc pl-5 mt-1 space-y-1">
                         <li>The line is a simple linear trend fitted through every logged weigh-in.</li>
                         <li>The slope is your average daily weight change: positive&nbsp;=&nbsp;gain, negative&nbsp;=&nbsp;loss.</li>
-                        <li>No assumption is made about maintenance—the line just reports what <em>is</em> happening.</li>
+                        <li>No assumption is made about maintenance - the line just reports what <em>is</em> happening.</li>
                         <li>If the dots hug the line (high&nbsp;R<sup>2</sup>) your logging is consistent; wide scatter means day-to-day noise.</li>
                       </ul>
                     </div>
@@ -2299,7 +2461,7 @@ export default function WeightTrackerApp() {
                       <span className="font-semibold text-gray-800">
                         {current.bodyFatPercentage.toFixed(1)}% 
                         <span className="text-xs text-gray-500 ml-1">
-                          (±{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0])/2).toFixed(1)}%)
+                          (+/-{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0])/2).toFixed(1)}%)
                         </span>
                       </span>
                     </div>
@@ -2308,7 +2470,7 @@ export default function WeightTrackerApp() {
                       <span className="font-semibold text-gray-800">
                         {current.fatMass.toFixed(1)} kg 
                         <span className="text-xs text-gray-500 ml-1">
-                          (±{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0]) * current.weight / 200).toFixed(1)} kg)
+                          (+/-{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0]) * current.weight / 200).toFixed(1)} kg)
                         </span>
                       </span>
                     </div>
@@ -2317,7 +2479,7 @@ export default function WeightTrackerApp() {
                       <span className="font-semibold text-gray-800">
                         {current.leanMass.toFixed(1)} kg
                         <span className="text-xs text-gray-500 ml-1">
-                          (±{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0]) * current.weight / 200).toFixed(1)} kg)
+                          (+/-{((current.bodyFatPercentageCI[1] - current.bodyFatPercentageCI[0]) * current.weight / 200).toFixed(1)} kg)
                         </span>
                       </span>
                     </div>
@@ -2338,7 +2500,7 @@ export default function WeightTrackerApp() {
                         : "This is based on your actual measurement."}
                     </div>
                     <p className="text-sm text-gray-600 mt-3 border-t border-gray-200 pt-2">
-                      Your current body composition, showing both fat mass and lean mass (muscle, water, bones). The ± value indicates the confidence range of the estimate.
+                      Your current body composition, showing both fat mass and lean mass (muscle, water, bones). The +/- value indicates the confidence range of the estimate.
                     </p>
                   </div>
                 );
@@ -2393,18 +2555,20 @@ export default function WeightTrackerApp() {
                         ? `Your body composition model was last calibrated on ${calibrationFactor.date}.`
                         : "Your body composition model has not been calibrated with measurements yet."}
                     </div>
-                    <p className="text-sm text-gray-600 mt-3 border-t border-gray-200 pt-2 space-y-2">
+                    <div className="text-sm text-gray-600 mt-3 border-t border-gray-200 pt-2 space-y-2">
                       <p>Shows how your body has changed since you first started tracking.</p>
                       <ul className="list-disc pl-5">
                         <li><strong>Fat percentage</strong> means that of your total weight change, this percentage is estimated to be fat tissue.</li>
                         <li><strong>Lean percentage</strong> means the remaining percentage is estimated to be muscle, water, bone, etc.</li>
                       </ul>
-                      <p className="mt-1"><strong>What's ideal?</strong></p>
-                      <ul className="list-disc pl-5">
-                        <li>When <u>gaining weight</u>: Higher lean % is better (more muscle, less fat).</li>
-                        <li>When <u>losing weight</u>: Higher fat % is better (preserving muscle while losing fat).</li>
-                      </ul>
-                    </p>
+                      <div className="mt-1">
+                        <p className="font-semibold">What's ideal?</p>
+                        <ul className="list-disc pl-5">
+                          <li>When <u>gaining weight</u>: Higher lean % is better (more muscle, less fat).</li>
+                          <li>When <u>losing weight</u>: Higher fat % is better (preserving muscle while losing fat).</li>
+                        </ul>
+                      </div>
+                    </div>
                   </div>
                 );
               })()}
@@ -2496,8 +2660,8 @@ export default function WeightTrackerApp() {
 
                 <h5 className="font-semibold">Between body-fat measurements</h5>
                 <ul className="list-disc pl-6 space-y-1">
-                  <li>Your calorie ↔ weight trend gives a personal <code className="font-mono">kcal&nbsp;/&nbsp;kg</code>.</li>
-                  <li>2000 kcal/kg ≈ all lean tissue, 7700 kcal/kg ≈ all fat tissue.</li>
+                  <li>Your calorie-to-weight trend gives a personal <code className="font-mono">kcal&nbsp;/&nbsp;kg</code>.</li>
+                  <li>2000 kcal/kg ~= all lean tissue, 7700 kcal/kg ~= all fat tissue.</li>
                   <li>Each scale change is split fat-vs-lean using that ratio, and BF % is updated.</li>
                 </ul>
 
@@ -2508,8 +2672,8 @@ export default function WeightTrackerApp() {
 
                 <h5 className="font-semibold pt-2">How to read the slope</h5>
                 <ul className="list-disc pl-6 space-y-1">
-                  <li>Flat / gentle rise with weight gain → mostly lean tissue.</li>
-                  <li>Steep rise with stable weight → hidden fat gain (water loss masking the scale).</li>
+                  <li>Flat / gentle rise with weight gain -> mostly lean tissue.</li>
+                  <li>Steep rise with stable weight -> hidden fat gain (water loss masking the scale).</li>
                   <li>Lower personal <code className="font-mono">kcal/kg</code> = more muscle-efficient surplus.</li>
                 </ul>
               </div>
@@ -2520,3 +2684,12 @@ export default function WeightTrackerApp() {
     </div>
   );
 } 
+
+
+
+
+
+
+
+
+
