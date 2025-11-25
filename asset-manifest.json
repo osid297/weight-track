@@ -1,0 +1,13 @@
+{
+  "files": {
+    "main.css": "/weight-track/static/css/main.fee530bd.css",
+    "main.js": "/weight-track/static/js/main.1fcc8b48.js",
+    "index.html": "/weight-track/index.html",
+    "main.fee530bd.css.map": "/weight-track/static/css/main.fee530bd.css.map",
+    "main.1fcc8b48.js.map": "/weight-track/static/js/main.1fcc8b48.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.fee530bd.css",
+    "static/js/main.1fcc8b48.js"
+  ]
+}
